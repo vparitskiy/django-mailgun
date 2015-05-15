@@ -1,18 +1,14 @@
-import requests
 from django.conf import settings
+from django.core.mail import EmailMultiAlternatives
 from django.core.mail.backends.base import BaseEmailBackend
 from django.core.mail.message import sanitize_address
 
-try:
-    from io import StringIO
-except ImportError:
-    try:
-        from cStringIO import StringIO
-    except ImportError:
-        from StringIO import StringIO
+import requests
+
 
 class MailgunAPIError(Exception):
     pass
+
 
 class MailgunBackend(BaseEmailBackend):
     """A Django Email backend that uses mailgun.
@@ -20,22 +16,20 @@ class MailgunBackend(BaseEmailBackend):
 
     def __init__(self, fail_silently=False, *args, **kwargs):
         access_key, server_name = (kwargs.pop('access_key', None),
-                                   kwargs.pop('server_name', None))
-    
-        super(MailgunBackend, self).__init__(
-                        fail_silently=fail_silently, 
-                        *args, **kwargs)
+                                   kwargs.pop('domain_name', None))
+
+        super(MailgunBackend, self).__init__(fail_silently=fail_silently, *args, **kwargs)
 
         try:
-            self._access_key = access_key or getattr(settings, 'MAILGUN_ACCESS_KEY')
-            self._server_name = server_name or getattr(settings, 'MAILGUN_SERVER_NAME')
+            self._access_key = access_key or getattr(settings, 'MAILGUN_API_KEY')
+            self._domain_name = server_name or getattr(settings, 'MAILGUN_DOMAIN_NAME')
         except AttributeError:
-            if fail_silently:
-                self._access_key, self._server_name = None, None
+            if self.fail_silently:
+                self._access_key, self._domain_name = None, None
             else:
                 raise
 
-        self._api_url = "https://api.mailgun.net/v2/%s/" % self._server_name
+        self._api_url = "https://api.mailgun.net/v3/{0}/".format(self._domain_name)
 
     def open(self):
         """Stub for open connection, all sends are done over HTTP POSTs
@@ -51,23 +45,38 @@ class MailgunBackend(BaseEmailBackend):
         """A helper method that does the actual sending."""
         if not email_message.recipients():
             return False
-        from_email = sanitize_address(email_message.from_email, email_message.encoding)
-        recipients = [sanitize_address(addr, email_message.encoding)
-                      for addr in email_message.recipients()]
+
+        clean_all = lambda address: [sanitize_address(a, email_message.encoding) for a in address]
+        text = email_message.content_subtype == 'plain' and email_message.body or None
+        html = email_message.content_subtype == 'html' and email_message.body or None
+
+        if isinstance(email_message, EmailMultiAlternatives):
+            for body, mime in email_message.alternatives:
+                if mime == 'text/html':
+                    html = body
 
         try:
-            r = requests.\
-                post(self._api_url + "messages.mime",
-                     auth=("api", self._access_key),
-                     data={
-                            "to": ", ".join(recipients),
-                            "from": from_email,
-                         },
-                     files={
-                            "message": StringIO(email_message.message().as_string()),
-                         }
-                     )
-        except:
+            r = requests.post(
+                self._api_url + "messages",
+                auth=("api", self._access_key),
+                data={
+                    'from': clean_all([email_message.from_email]),
+                    'to': clean_all(email_message.to),
+                    'cc': clean_all(email_message.cc),
+                    'bcc': clean_all(email_message.bcc),
+                    'subject': email_message.subject,
+                    'text': text,
+                    'html': html,
+                },
+                files=[
+                    ('attachment', (filename, content))
+                    for filename, content, mimetype in [
+                        attachment for attachment in email_message.attachments
+                        if isinstance(attachment, tuple)
+                        ]
+                    ]
+            )
+        except Exception:
             if not self.fail_silently:
                 raise
             return False
